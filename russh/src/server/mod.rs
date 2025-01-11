@@ -42,9 +42,10 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::pin;
 use tokio::task::JoinHandle;
+use ssh_encoding::Reader as _;
 
 use crate::cipher::{clear, CipherPair, OpeningKey};
-use crate::keys::key;
+use crate::keys::{encoding::Reader, key};
 use crate::session::*;
 use crate::ssh_read::*;
 use crate::sshbuffer::*;
@@ -523,6 +524,12 @@ pub trait Handler: Sized {
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
+
+    #[allow(unused_variables)]
+    async fn received_sshid(&mut self, sshid: &[u8]) {}
+
+    #[allow(unused_variables)]
+    async fn received_kex_init_packet(&mut self, packet: &KexInitPacket) {}
 }
 
 #[async_trait]
@@ -531,7 +538,7 @@ pub trait Server {
     /// The type of handlers.
     type Handler: Handler + Send + 'static;
     /// Called when a new client connects.
-    fn new_client(&mut self, peer_addr: Option<std::net::SocketAddr>) -> Self::Handler;
+    fn new_client(&mut self, peer_addr: std::net::SocketAddr) -> Self::Handler;
     /// Called when an active connection fails.
     fn handle_session_error(&mut self, _error: <Self::Handler as Handler>::Error) {}
 
@@ -555,9 +562,9 @@ pub trait Server {
             tokio::select! {
                 accept_result = socket.accept() => {
                     match accept_result {
-                        Ok((socket, _)) => {
+                        Ok((socket, peer_addr)) => {
                             let config = config.clone();
-                            let  handler = self.new_client(socket.peer_addr().ok());
+                            let  handler = self.new_client(peer_addr);
                             let error_tx = error_tx.clone();
                             tokio::spawn(async move {
                                 let session = match run_stream(config, socket,  handler).await {
@@ -763,6 +770,9 @@ async fn reply<H: Handler + Send>(
         match session.common.kex.take() {
             Some(Kex::Init(kexinit)) => {
                 if kexinit.algo.is_some() || buf.first() == Some(&msg::KEXINIT) {
+                    let packet = get_kex_init_packet(buf)?;
+                    handler.received_kex_init_packet(&packet).await;
+
                     session.common.kex = Some(kexinit.server_parse(
                         session.common.config.as_ref(),
                         &mut *session.common.cipher.local_to_remote,
@@ -825,4 +835,67 @@ async fn reply<H: Handler + Send>(
     } else {
         Ok(session.server_read_encrypted(handler, seqn, buf).await?)
     }
+}
+
+type Names = Vec<Vec<u8>>;
+
+#[derive(Clone, Debug)]
+pub struct KexInitPacket {
+    pub cookie: [u8; 16],
+    pub kex: Names,
+    pub host_key: Names,
+    pub c2s_ciphers: Names,
+    pub s2c_ciphers: Names,
+    pub c2s_macs: Names,
+    pub s2c_macs: Names,
+    pub c2s_compression: Names,
+    pub s2c_compression: Names,
+    pub c2s_languages: Names,
+    pub s2c_languages: Names,
+    pub reserved: u32,
+
+}
+
+fn get_kex_init_packet(buf: &[u8]) -> Result<KexInitPacket, crate::Error> {
+    fn read_name_list(
+        reader: &mut russh_keys::encoding::Position
+    ) -> Result<Vec<Vec<u8>>, russh_keys::Error> {
+        reader
+            .read_string()
+            .map(|s| s
+                .split(|x| *x == b',')
+                .filter(|x| !x.is_empty())
+                .map(Into::into).collect()
+            )
+    }
+
+    let mut reader = buf.reader(1);
+    let mut cookie = [0; 16];
+    reader.read(&mut cookie).map_err(russh_keys::Error::from)?;
+    let kex = read_name_list(&mut reader)?;
+    let host_key = read_name_list(&mut reader)?;
+    let c2s_ciphers = read_name_list(&mut reader)?;
+    let s2c_ciphers = read_name_list(&mut reader)?;
+    let c2s_macs = read_name_list(&mut reader)?;
+    let s2c_macs = read_name_list(&mut reader)?;
+    let c2s_compression = read_name_list(&mut reader)?;
+    let s2c_compression = read_name_list(&mut reader)?;
+    let c2s_languages = read_name_list(&mut reader)?;
+    let s2c_languages = read_name_list(&mut reader)?;
+    let reserved = reader.read_u32()?;
+
+    Ok(KexInitPacket {
+        cookie,
+        kex,
+        host_key,
+        c2s_ciphers,
+        s2c_ciphers,
+        c2s_macs,
+        s2c_macs,
+        c2s_compression,
+        s2c_compression,
+        c2s_languages,
+        s2c_languages,
+        reserved
+    })
 }

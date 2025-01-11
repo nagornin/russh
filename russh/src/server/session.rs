@@ -390,6 +390,7 @@ impl Session {
         H: Handler + Send + 'static,
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        handler.received_sshid(&self.common.remote_sshid).await;
         self.flush()?;
         stream
             .write_all(&self.common.write_buffer.buffer)
